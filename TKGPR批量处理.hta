@@ -1,0 +1,510 @@
+<html>
+<head>
+<title>TKGPR 图框批量处理</title>
+<meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+<hta:application id="TKGPR" applicationname="TKGPR" singleinstance="yes" scroll="no" contextmenu="no"/>
+<style>
+body{font-family:Microsoft YaHei,SimSun;font-size:13px;background:#f4f6f8;margin:0;padding:10px}
+table{border-collapse:collapse}
+td{padding:4px 6px;white-space:nowrap}
+input.txt{width:430px;height:22px;border:1px solid #b8c0c8;padding:2px 4px}
+input.mini{width:60px;height:22px;border:1px solid #b8c0c8;padding:2px 4px}
+button{height:26px;padding:0 10px;cursor:pointer}
+#log{width:100%;height:250px;background:#14171a;color:#cfe3cf;font-family:Consolas,SimSun;font-size:12px;border:1px solid #555}
+h1{font-size:15px;margin:2px 0 10px 0;color:#1a5}
+#status{color:#b00;font-weight:bold}
+.small{color:#677;font-size:12px}
+</style>
+</head>
+<body>
+<h1>图框批量处理（改名 · 刷新图框 · 折行居中 · 存盘 · 关闭）</h1>
+<table>
+<tr>
+  <td>根文件夹</td>
+  <td><input class="txt" id="root" type="text">
+      <button id="btnBrowseRoot" onclick="BrowseRoot">浏览…</button>
+      <button id="btnActiveDoc" onclick="UseActiveDoc">当前图纸目录</button>
+      <button id="btnLocate" onclick="LocateByFile">选文件定位</button></td>
+</tr>
+<tr>
+  <td>工作包 XML</td>
+  <td><input class="txt" id="xml" type="text">
+      <button id="btnFindXml" onclick="AutoFindXml">自动查找</button>
+      <button id="btnBrowseXml" onclick="BrowseXmlFolder">浏览文件夹</button>
+      <span class="small">（自动查找：本层、工作包子文件夹、上级\工作包）</span></td>
+</tr>
+<tr>
+  <td>改名模式</td>
+  <td><input class="txt" id="pat" type="text">（通配符；留空 = 跳过改名）</td>
+</tr>
+<tr>
+  <td>新图框块名</td>
+  <td><input class="txt" id="newname" type="text">（留空 = 按工作包项目编号自动生成）</td>
+</tr>
+<tr>
+  <td>优先关键字</td>
+  <td><input class="txt" id="pref" type="text">（一张图里多个图框都被用到时，按此关键字选定，如 <code>20XXJS000CS-乙</code>；留空 = 不动）</td>
+</tr>
+<tr>
+  <td>图框比例</td>
+  <td><input class="mini" id="scale" type="text" value="1">（居中距离按此缩放）</td>
+</tr>
+<tr>
+  <td>清理</td>
+  <td><input id="dopurge" type="checkbox"> 清理无用的图框块定义（仅删图面没有实例的历史图框块，图纸内容不动）</td>
+</tr>
+</table>
+<p>
+  <button id="btnStart" onclick="StartBatch" style="width:130px;height:32px;font-weight:bold">开始处理</button>
+  <span id="status" class="small"></span>
+</p>
+<textarea id="log" readonly></textarea>
+
+<script language="VBScript">
+Dim fso, ws, sh, app, polling
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set ws  = CreateObject("WScript.Shell")
+Set sh  = CreateObject("Shell.Application")
+polling = False
+
+' ---------- 初始化：回填上次参数 ----------
+Call InitForm
+
+' ★ 本机 mshta 的内联 onclick 属性 / setTimeout 字符串都解析不了 VBScript 的
+'   Sub 名（报"对象不支持此属性或方法"），必须用 GetRef 编程绑定事件，
+'   且 setTimeout 一律传 GetRef 而不是过程名字符串（2026-09-21 实测验证）。
+Sub Window_OnLoad
+  document.getElementById("btnStart").onclick     = GetRef("StartBatch")
+  document.getElementById("btnBrowseRoot").onclick = GetRef("BrowseRoot")
+  document.getElementById("btnActiveDoc").onclick  = GetRef("UseActiveDoc")
+  document.getElementById("btnLocate").onclick     = GetRef("LocateByFile")
+  document.getElementById("btnFindXml").onclick    = GetRef("AutoFindXml")
+  document.getElementById("btnBrowseXml").onclick  = GetRef("BrowseXmlFolder")
+End Sub
+
+Sub InitForm
+  document.getElementById("root").Value = RegGet("RootDir")
+  document.getElementById("xml").Value  = RegGet("Xml")
+  document.getElementById("pat").Value  = RegGet("Pattern")
+  document.getElementById("newname").Value = RegGet("NewName")
+  document.getElementById("pref").Value    = RegGet("Prefer")
+  document.getElementById("scale").Value = RegGet("Scale")
+  If document.getElementById("scale").Value = "" Then document.getElementById("scale").Value = "1"
+  document.getElementById("dopurge").Checked = (RegGet("DoPurge") = "1")
+End Sub
+
+Function RegGet(name)
+  On Error Resume Next
+  RegGet = ws.RegRead("HKCU\Software\TKGM\" & name)
+  If Err.Number <> 0 Then RegGet = ""
+  On Error GoTo 0
+End Function
+
+Sub RegSet(name, v)
+  On Error Resume Next
+  ws.RegWrite "HKCU\Software\TKGM\" & name, v
+  On Error GoTo 0
+End Sub
+
+Function HtaDir()
+  Dim u, p
+  u = document.URL
+  ' 本机 mshta 实测返回 "file://E:\dir\x.hta"（反斜杠+盘符直出），教科书形态
+  ' 是 "file:///E:/dir/x.hta"（正斜杠+百分号编码）。两种都要兼容。
+  If Left(u, 8) = "file:///" Then
+    u = Mid(u, 9)
+  ElseIf Left(u, 7) = "file://" Then
+    u = Mid(u, 8)
+  End If
+  p = Replace(u, "/", "\")
+  ' 剥掉残留的前导反斜杠（本工具只处理本机盘符路径，不涉 UNC）
+  Do While Left(p, 1) = "\"
+    p = Mid(p, 2)
+  Loop
+  ' 有的 mshta 会把中文按 UTF-8 百分号编码；含百分号就按 UTF-8 解码
+  If InStr(p, "%") > 0 Then p = Utf8PercentDecode(p)
+  HtaDir = fso.GetParentFolderName(p)
+End Function
+
+' 把含 %XX（UTF-8 编码）的字符串解码为正确的 Unicode 字符串
+Function Utf8PercentDecode(s)
+  Dim raw(), n, i, k, c, hi, out, cp, b1, b2, b3, b4
+  n = Len(s)
+  ReDim raw(n - 1)
+  k = 0 : i = 1
+  Do While i <= Len(s)
+    c = Mid(s, i, 1)
+    If c = "%" And i + 2 <= Len(s) Then
+      hi = CLng("&H" & Mid(s, i + 1, 2))
+      raw(k) = hi : k = k + 1 : i = i + 3
+    Else
+      raw(k) = Asc(c) : k = k + 1 : i = i + 1
+    End If
+  Loop
+  ReDim Preserve raw(k - 1)
+  out = "" : i = 0
+  Do While i <= UBound(raw)
+    b1 = raw(i)
+    If b1 < &H80 Then
+      out = out & ChrW(b1) : i = i + 1
+    ElseIf (b1 And &HE0) = &HC0 Then
+      b2 = raw(i + 1)
+      cp = ((b1 And &H1F) * &H40) + (b2 And &H3F)
+      out = out & ChrW(cp) : i = i + 2
+    ElseIf (b1 And &HF0) = &HE0 Then
+      b2 = raw(i + 1) : b3 = raw(i + 2)
+      cp = ((b1 And &H0F) * &H1000) + ((b2 And &H3F) * &H40) + (b3 And &H3F)
+      out = out & ChrW(cp) : i = i + 3
+    ElseIf (b1 And &HF8) = &HF0 Then
+      b2 = raw(i + 1) : b3 = raw(i + 2) : b4 = raw(i + 3)
+      cp = ((b1 And &H07) * &H40000) + ((b2 And &H3F) * &H1000) + ((b3 And &H3F) * &H40) + (b4 And &H3F)
+      out = out & ChrW(cp) : i = i + 4
+    Else
+      out = out & ChrW(b1) : i = i + 1
+    End If
+  Loop
+  Utf8PercentDecode = out
+End Function
+
+Function IsSystemPath(p)
+  Dim low
+  IsSystemPath = False
+  If p = "" Then
+    IsSystemPath = True
+    Exit Function
+  End If
+  low = LCase(p)
+  If InStr(low, "program files") > 0 Or InStr(low, "windows\") > 0 _
+     Or InStr(low, "zwsoft") > 0 Then IsSystemPath = True
+End Function
+
+' ---------- 选择器 ----------
+Sub BrowseRoot
+  Dim f, v
+  Set f = sh.BrowseForFolder(0, "选择要处理的根文件夹", 0, document.getElementById("root").Value)
+  If f Is Nothing Then Exit Sub
+  v = f.Self.Path
+  If IsSystemPath(v) Then
+    MsgBox "选中的是 CAD/系统程序目录，请重新选择。"
+    Exit Sub
+  End If
+  document.getElementById("root").Value = v
+End Sub
+
+Sub UseActiveDoc
+  Dim app, d, v
+  On Error Resume Next
+  Set app = GetObject(, "ZWCAD.Application")
+  If Err.Number <> 0 Then
+    MsgBox "未找到正在运行的 ZWCAD。"
+    On Error GoTo 0
+    Exit Sub
+  End If
+  Set d = app.ActiveDocument
+  v = d.Path
+  On Error GoTo 0
+  If IsSystemPath(v) Then
+    MsgBox "当前图纸目录在 CAD 程序目录下（多半是未保存的新图），请改用浏览。"
+    Exit Sub
+  End If
+  document.getElementById("root").Value = v
+End Sub
+
+Sub LocateByFile
+  Dim f, v, folder, fc, lst, n
+  Set f = sh.BrowseForFolder(0, "先选包含目标图纸的文件夹", 0, document.getElementById("root").Value)
+  If f Is Nothing Then Exit Sub
+  v = f.Self.Path
+  If IsSystemPath(v) Then
+    MsgBox "选中的是 CAD/系统程序目录，请重新选择。"
+    Exit Sub
+  End If
+  Set folder = fso.GetFolder(v)
+  lst = "" : n = 0
+  Dim f2
+  For Each f2 In folder.Files
+    If LCase(fso.GetExtensionName(f2.Name)) = "dwg" Then
+      n = n + 1
+      lst = lst & n & ") " & f2.Name & vbCrLf
+    End If
+  Next
+  If n = 0 Then
+    document.getElementById("root").Value = v
+    Exit Sub
+  End If
+  MsgBox "该文件夹内的 DWG 共 " & n & " 张，取其所在文件夹作为根目录。"
+  document.getElementById("root").Value = v
+End Sub
+
+Sub AutoFindXml
+  Dim root, cands
+  root = document.getElementById("root").Value
+  If root = "" Then
+    MsgBox "请先选根文件夹。"
+    Exit Sub
+  End If
+  Set cands = CreateObject("Scripting.Dictionary")
+  Call AddXmls(root & "\工作包", cands)
+  Call AddXmls(fso.GetParentFolderName(root) & "\工作包", cands)
+  Call AddXmls(root, cands)
+  Dim k, arr, lst, i2
+  If cands.Count = 1 Then
+    document.getElementById("xml").Value = cands.Items()(0)
+    Exit Sub
+  End If
+  If cands.Count > 1 Then
+    arr = cands.Items() : lst = ""
+    Dim lastX
+    lastX = LCase(RegGet("Xml"))
+    For i2 = 0 To cands.Count - 1
+      lst = lst & (i2 + 1) & ") " & arr(i2)
+      If lastX <> "" And LCase(arr(i2)) = lastX Then lst = lst & "   ← 上次使用"
+      lst = lst & vbCrLf
+    Next
+    k = InputBox("找到 " & cands.Count & " 个工作包 XML，请输入序号：" & vbCrLf & vbCrLf & lst, "TKGPR", "1")
+    If IsNumeric(k) Then
+      k = CInt(k)
+      If k >= 1 And k <= cands.Count Then
+        document.getElementById("xml").Value = arr(k - 1)
+        Exit Sub
+      End If
+    End If
+    Exit Sub
+  End If
+  MsgBox "未找到工作包 XML。请浏览选择「工作包」文件夹，或直接粘贴完整路径。"
+End Sub
+
+Sub AddXmls(dir_, dict)
+  Dim fo4
+  On Error Resume Next
+  If dir_ = "" Then Exit Sub
+  If Not fso.FolderExists(dir_) Then Exit Sub
+  If IsSystemPath(dir_) Then Exit Sub
+  For Each fo4 In fso.GetFolder(dir_).Files
+    If LCase(fso.GetExtensionName(fo4.Name)) = "xml" Then
+      If Not dict.Exists(LCase(fo4.Path)) Then dict.Add LCase(fo4.Path), fo4.Path
+    End If
+  Next
+  On Error GoTo 0
+End Sub
+
+Sub BrowseXmlFolder
+  Dim f, d
+  Set f = sh.BrowseForFolder(0, "选择「工作包」文件夹", 0, document.getElementById("root").Value)
+  If f Is Nothing Then Exit Sub
+  d = f.Self.Path
+  Dim cands
+  Set cands = CreateObject("Scripting.Dictionary")
+  Call AddXmls(d, cands)
+  If cands.Count >= 1 Then
+    document.getElementById("xml").Value = cands.Items()(cands.Count - 1)
+  Else
+    MsgBox "该文件夹下没有 xml。"
+  End If
+End Sub
+
+' ---------- 批处理 ----------
+Sub StartBatch
+  If polling Then Exit Sub
+  Dim root, xml, pat, nn, sc, purgeS, pref
+  root = Trim(document.getElementById("root").Value)
+  xml  = Trim(document.getElementById("xml").Value)
+  pat  = Trim(document.getElementById("pat").Value)
+  nn   = Trim(document.getElementById("newname").Value)
+  pref = Trim(document.getElementById("pref").Value)
+  sc   = Trim(document.getElementById("scale").Value)
+  If document.getElementById("dopurge").Checked Then purgeS = "1" Else purgeS = "0"
+
+  If root = "" Or Not fso.FolderExists(root) Then
+    MsgBox "根文件夹无效。"
+    Exit Sub
+  End If
+  If IsSystemPath(root) Then
+    MsgBox "根文件夹是 CAD/系统程序目录，请重新选择。"
+    Exit Sub
+  End If
+  If xml = "" Or Not fso.FileExists(xml) Then
+    MsgBox "工作包 XML 无效。"
+    Exit Sub
+  End If
+  If sc = "" Or Not IsNumeric(sc) Then sc = "1"
+
+  ' 连接 ZWCAD
+  On Error Resume Next
+  Set app = GetObject(, "ZWCAD.Application")
+  If Err.Number <> 0 Then
+    On Error GoTo 0
+    MsgBox "未找到正在运行的 ZWCAD。请先打开 ZWCAD（并打开任意一张图纸）。"
+    Exit Sub
+  End If
+  On Error GoTo 0
+  Set docs = app.Documents
+
+  ' 参数入注册表（供 TKGREN/TKGFIX 读取）
+  Call RegSet("RootDir", root)
+  Call RegSet("Xml", xml)
+  Call RegSet("Pattern", pat)
+  Call RegSet("NewName", nn)
+  Call RegSet("Prefer", pref)
+  Call RegSet("Scale", sc)
+  Call RegSet("DoPurge", purgeS)
+
+  ' 收集 + 备份 + 写配置（此处起全程容错，任何一步出错都弹提示而不是静默崩）
+  On Error Resume Next
+  Dim files, cnt, stamp, bakDir, rel, dst, i2
+  Set files = CreateObject("Scripting.Dictionary")
+  Err.Clear
+  Call CollectDwg(root, files)
+  cnt = files.Count
+  If Err.Number <> 0 Then
+    MsgBox "收集图纸出错(" & Err.Number & ")：" & Err.Description
+    Exit Sub
+  End If
+  If cnt = 0 Then
+    MsgBox "该文件夹下没有 DWG。"
+    Exit Sub
+  End If
+  stamp = Year(Now) & Right("0" & Month(Now),2) & Right("0" & Day(Now),2) & _
+          Right("0" & Hour(Now),2) & Right("0" & Minute(Now),2) & Right("0" & Second(Now),2)
+  bakDir = root & "\备份_" & stamp
+  MkDirs bakDir
+  Dim f3, rel2, dst2
+  For Each f3 In files.Keys
+    rel2 = Mid(f3, Len(root) + 2)
+    dst2 = bakDir & "\" & rel2
+    Call MkDirs(fso.GetParentFolderName(dst2))
+    fso.CopyFile f3, dst2, True
+  Next
+  If Err.Number <> 0 Then
+    MsgBox "备份出错(" & Err.Number & ")：" & Err.Description & vbCrLf & "已中止。", , "TKGPR"
+    Exit Sub
+  End If
+
+  Dim logfile, iniPath
+  logfile = root & "\TKGPR日志_" & stamp & ".txt"
+  If fso.FileExists(logfile) Then fso.DeleteFile logfile, True
+  iniPath = ws.ExpandEnvironmentStrings("%TEMP%") & "\tkgm_batch.ini"
+  Dim ih
+  Set ih = fso.CreateTextFile(iniPath, True)
+  ih.WriteLine "root=" & root
+  ih.WriteLine "xml=" & xml
+  ih.WriteLine "pat=" & pat
+  ih.WriteLine "newname=" & nn
+  ih.WriteLine "prefer=" & pref
+  ih.WriteLine "scale=" & sc
+  ih.WriteLine "purge=" & purgeS
+  ih.WriteLine "lsp=" & HtaDir & "\图框块批量改名.lsp"
+  ih.WriteLine "helper=" & HtaDir & "\_tgkm_openhelper.vbs"
+  ih.WriteLine "doneflag=" & ws.ExpandEnvironmentStrings("%TEMP%") & "\tkgm_done.flag"
+  ih.WriteLine "log=" & logfile
+  ih.Close
+  If Not fso.FileExists(iniPath) Then
+    MsgBox "参数文件写入失败：" & iniPath, , "TKGPR"
+    Exit Sub
+  End If
+
+  ' 启动后台引擎
+  Dim worker
+  worker = HtaDir & "\_tgkm_batchworker.vbs"
+  If Not fso.FileExists(worker) Then
+    MsgBox "找不到引擎脚本 _tgkm_batchworker.vbs（应与本页面在同一文件夹）。"
+    Exit Sub
+  End If
+  AppendLog "===== 开始处理 " & cnt & " 张（备份目录 " & bakDir & "）====="
+  AppendLog "引擎脚本：" & worker
+  AppendLog "日志文件：" & logfile
+  polling = True
+  document.getElementById("btnStart").Disabled = True
+  document.getElementById("status").innerHTML = "处理中…"
+  ws.Run "wscript.exe """ & worker & """", 0, False
+  shownLines = 0
+  pollTicks = 0
+  diagShown = False
+  workerLog = logfile
+  window.setTimeout GetRef("PollWorker"), 800
+End Sub
+
+Dim shownLines, workerLog, pollTicks, diagShown
+shownLines = 0
+workerLog = ""
+pollTicks = 0
+diagShown = False
+
+Sub PollWorker
+  Dim f, all, arr, i2
+  On Error Resume Next
+  If fso.FileExists(workerLog) Then
+    all = Split(fso.OpenTextFile(workerLog, 1).ReadAll, vbCrLf)
+    If UBound(all) >= shownLines Then
+      For i2 = shownLines To UBound(all)
+        If Trim(all(i2)) <> "" Then AppendLog all(i2)
+      Next
+      shownLines = UBound(all) + 1
+    End If
+    Err.Clear
+  End If
+  ' 早期诊断：启动约 8 秒还没日志文件 -> 引擎多半没起来
+  If pollTicks > 10 And Not diagShown And Not fso.FileExists(workerLog) Then
+    diagShown = True
+    AppendLog "！！约 8 秒仍无日志，疑似引擎未启动。"
+    AppendLog "    检查点 1：" & workerLog
+    AppendLog "    检查点 2：" & ws.ExpandEnvironmentStrings("%TEMP%") & "\tkgm_batch.ini"
+  End If
+  ' 完成判定：日志出现“全部完成”
+  Dim doneNow
+  doneNow = False
+  If fso.FileExists(workerLog) Then
+    If InStr(fso.OpenTextFile(workerLog, 1).ReadAll, "全部完成") > 0 Then doneNow = True
+  End If
+  If doneNow Then
+    polling = False
+    document.getElementById("btnStart").Disabled = False
+    document.getElementById("status").innerHTML = "完成 √"
+    AppendLog "===== 批处理结束 ====="
+    Exit Sub
+  End If
+  ' 兜底：长时间既没完成也没新日志（引擎可能已崩），停止轮询并提示看日志
+  pollTicks = pollTicks + 1
+  If pollTicks > 860 Then                     ' 约 10 分钟
+    polling = False
+    document.getElementById("btnStart").Disabled = False
+    document.getElementById("status").innerHTML = "已超时"
+    AppendLog "！！轮询超时（约10分钟无进展），请直接查看日志：" & workerLog
+    Exit Sub
+  End If
+  window.setTimeout GetRef("PollWorker"), 700
+  On Error GoTo 0
+End Sub
+
+Sub AppendLog(s)
+  Dim t
+  t = document.getElementById("log")
+  t.Value = t.Value & s & vbCrLf
+  t.scrollTop = t.scrollHeight
+End Sub
+
+Sub MkDirs(p)
+  On Error Resume Next
+  If p = "" Then Exit Sub
+  If fso.FolderExists(p) Then Exit Sub
+  Call MkDirs(fso.GetParentFolderName(p))
+  If Not fso.FolderExists(p) Then fso.CreateFolder p
+  On Error GoTo 0
+End Sub
+
+Sub CollectDwg(folder, dict)
+  Dim f2, s2
+  On Error Resume Next
+  For Each f2 In fso.GetFolder(folder).Files
+    If LCase(fso.GetExtensionName(f2.Name)) = "dwg" Then
+      If Left(f2.Name, 2) <> "~$" Then dict.Add f2.Path, f2.Path
+    End If
+  Next
+  For Each s2 In fso.GetFolder(folder).SubFolders
+    If Left(s2.Name, 2) <> "备份" Then CollectDwg s2.Path, dict
+  Next
+  On Error GoTo 0
+End Sub
+</script>
+</body>
+</html>
